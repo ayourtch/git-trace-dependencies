@@ -54,6 +54,19 @@ my $fork_point_arg = "v20.01-rc0";
 my $master_head_arg = "refs/heads/master";
 my $lts_branch_arg = "stable/1908";
 
+while (($#ARGV >= 0)  && (substr($ARGV[0], 0, 1) eq "-")) {
+	if ($ARGV[0] eq "-v") { $do_print += 1; }
+	if ($ARGV[0] eq "-f") { $do_full_analysis += 1; }
+	if ($ARGV[0] eq "-g") { $do_graphviz += 1; }
+	if ($ARGV[0] eq "-n") { $do_nocolor += 1; }
+	if ($ARGV[0] eq "-a") { $do_add_solo_commits += 1; }
+	if ($ARGV[0] eq "--source-latest") { shift(@ARGV); $master_head_arg = $ARGV[0]; }
+	if ($ARGV[0] eq "--fork-point") { shift(@ARGV); $fork_point_arg = $ARGV[0]; }
+	if ($ARGV[0] eq "--dest-branch") { shift(@ARGV); $lts_branch_arg = $ARGV[0]; }
+	shift(@ARGV);
+}
+
+
 sub parse_hunk_header {
 	my ($line) = @_;
 	my ($o_ofs, $o_cnt, $n_ofs, $n_cnt) =
@@ -221,15 +234,6 @@ $git_root = `git rev-parse --show-toplevel`;
 $git_root =~ s/^\s+//;
 $git_root =~ s/\s+$//;
 chdir($git_root) or die "$!";
-
-while (($#ARGV >= 0)  && (substr($ARGV[0], 0, 1) eq "-")) {
-	if ($ARGV[0] eq "-v") { $do_print += 1; }
-	if ($ARGV[0] eq "-f") { $do_full_analysis += 1; }
-	if ($ARGV[0] eq "-g") { $do_graphviz += 1; }
-	if ($ARGV[0] eq "-n") { $do_nocolor += 1; }
-	if ($ARGV[0] eq "-a") { $do_add_solo_commits += 1; }
-	shift(@ARGV);
-}
 
 my ($oldrev_arg, $newrev_arg) = @ARGV;
 
