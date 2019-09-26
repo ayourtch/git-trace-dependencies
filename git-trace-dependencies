@@ -1,0 +1,440 @@
+#!/usr/bin/perl -w
+#
+#
+# Based on git-diff-blame - https://github.com/dmnd/git-diff-blame
+#
+# Adapted for use predominantly in the VPP project
+# (https://wiki.fd.io/view/VPP) by Andrew Yourtchenko (ayourtch@gmail.com)
+#
+# The idea is at some point you have a "fork" between the two branches,
+# and then the "long term support" branch picks up some of the fixes from
+# master branch - specifically, the API changes are to be avoided.
+#
+# The GraphViz generates a nice SVG that is colored as follows:
+#
+#   - all blue: already cherry-picked according to git cherry
+#   - blue with yellow on the left: git cherry did not detect
+#     the cherry-pick, but I matched the gerrit Change-Id field,
+#     thus presumably making it a cherry-pick.
+#   - yellow with a bit of red: this is an API change,
+#     but it is only addition. Doublecheck that the addition
+#     is not within existing message and you might be ok to
+#     cherry-pick it.
+#   - red: the commit changes the API files by means of
+#     deletion as well, thus making it unsuitable for
+#     a cherry-pick.
+#
+#   As it is obvious, this is a somewhat specialized tool,
+#   but hopefully this being Perl makes it very easy to
+#   tweak if you need something similar but slightly different.
+#
+# Usage:
+#
+#     git-trace-dependencies -g -f > /tmp/x1.dot
+#
+# for no-colors:
+#
+#     git-trace-dependencies -n -g -f > /tmp/x1.dot
+#
+#
+# Then convert to SVG:
+#
+# dot -Tsvg:svg:core -o /shared/out1.svg /tmp/x1.dot
+#
+#
+use Data::Dumper;
+
+my $do_print = 0; # -v
+my $do_full_analysis = 0; # -f
+my $do_graphviz = 0; # -g
+my $do_nocolor = 0; # -n
+my $do_add_solo_commits = 0; # -a 
+
+my $fork_point_arg = "v20.01-rc0";
+my $master_head_arg = "refs/heads/master";
+my $lts_branch_arg = "stable/1908";
+
+sub parse_hunk_header {
+	my ($line) = @_;
+	my ($o_ofs, $o_cnt, $n_ofs, $n_cnt) =
+	    $line =~ /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+	$o_cnt = 1 unless defined $o_cnt;
+	$n_cnt = 1 unless defined $n_cnt;
+	return ($o_ofs, $o_cnt, $n_ofs, $n_cnt);
+}
+
+sub get_blame_prefix {
+	my ($line) = @_;
+	$line =~ /^(\^?[0-9a-f]+\s+(\S+\s+)?\([^\)]+\))/ or die "bad blame output: $line";
+	return $1;
+}
+
+sub git_rev_parse { 
+	my ($rev_arg) = @_;
+	my ($revparse);
+	open($revparse, '-|', 'git', 'rev-parse', $rev_arg) or die;
+	if (my $rev = <$revparse>) { chomp($rev); return $rev; } else { die };
+}
+
+sub get_anchor_commits {
+	my ($newrev, %revlist) = @_;
+	my ($oldrev) = "$newrev~1" ;
+	print STDERR "DEBUG: Getting anchor commits for $newrev" if $do_print > 1;
+	open($diff, '-|', 'git', '--no-pager', 'diff', "-U5", $oldrev, $newrev) or die;
+	my (@anchor_commits);
+
+	my ($pre, $post);
+	my $filename;
+	while (<$diff>) {
+		if (m{^diff --git ./(.*) ./\1$}) {
+			close $pre if defined $pre;
+			close $post if defined $post;
+			# print if ($do_print);
+			$prefilename = "./" . $1;
+			$postfilename = "./" . $1;
+			$delete = $create = 0;
+		} elsif (m{^diff --git ./(.*) ./(.*)$}) {
+			close $pre if defined $pre;
+			close $post if defined $post;
+			# print if ($do_print);
+			$prefilename = "./" . $1;
+			$postfilename = "./" . $2;
+			$delete = $create = 0;
+		} elsif (m{^similarity index \d+\%$}) {
+
+		} elsif (m{^new file}) {
+			$create = 1;
+			$prefilename = '/dev/null';
+		} elsif (m{^deleted file}) {
+			$delete = 1;
+			$postfilename = '/dev/null';
+		} elsif (m{^--- $prefilename$}) {
+			# ignore
+			# print if ($do_print);
+		} elsif (m{^rename from $prefilename$}) {
+			# ignore
+			# print if ($do_print);
+		} elsif (m{^\+\+\+ $postfilename$}) {
+			# ignore
+			# print if ($do_print);
+		} elsif (m{^rename to $postfilename$}) {
+			# ignore
+			# print if ($do_print);
+		} elsif (m{^@@ }) {
+			my ($o_ofs, $o_cnt, $n_ofs, $n_cnt)
+				= parse_hunk_header($_);
+			my $o_end = $o_ofs + $o_cnt - 1;
+			my $n_end = $n_ofs + $n_cnt - 1;
+			if (!$create) {
+				open($pre, '-|', 'git', 'blame', '-l', '-M', "-L$o_ofs,$o_end",
+				     $oldrev, '--', $prefilename) or die;
+			}
+			if (!$delete) {
+				if ($newrev) {
+					open($post, '-|', 'git', 'blame', '-l', '-M', "-L$n_ofs,$n_end",
+					     $newrev, '--', $postfilename) or die;
+				} else {
+					open($post, '-|', 'git', 'blame', '-l', '-M', "-L$n_ofs,$n_end",
+					     '--', $postfilename) or die;
+				}
+			}
+		} elsif (m{^ }) {
+			my $prefix = get_blame_prefix(scalar <$pre>);
+	                $prefix =~ /^(\^?[0-9a-f]+)\s+((\S+\s+)?\([^\)]+\))/ or die "bad blame output: $prefix";
+			my $commit = $1;
+			print STDERR "    ", $prefix, "\t", $_ if $do_print > 1;
+			push(@anchor_commits, $commit);
+			scalar <$post>; # discard
+		} elsif (m{^\-}) {
+			print STDERR " -  ", get_blame_prefix(scalar <$pre>), "\t", $_,"" if $do_print > 1;
+		} elsif (m{^\+}) {
+			print STDERR " +  ", get_blame_prefix(scalar <$post>), "\t", $_,"" if $do_print > 1;
+		}
+	}
+	my @sorted_anchor_commits = sort(@anchor_commits);
+	my $last_commit = "";
+	my @out_commits;
+	foreach(@sorted_anchor_commits) {
+		if ($last_commit ne $_) {
+			$last_commit = $_;
+			if(exists($revlist{$last_commit})) {
+				push(@out_commits, $last_commit);
+			}
+		}
+	}
+	@out_commits;
+}
+
+sub gv_print_commit {
+	my ($curr_commit, %revdesc) = @_;
+	my $style = "";
+	my $style_label = "";
+	$changeid = $revdesc{"$curr_commit-changeid"};
+	
+	if (!exists($revdesc{"$curr_commit-cpick"})) {
+		$style = "; style=filled, fillcolor=gray";
+		$style_label = " | cherrypick status unknown";
+	} elsif ($revdesc{"$curr_commit-cpick"} == 1) {
+		$style = "; style=filled, fillcolor=blue";
+		$style_label = " | picked (as per git-cherry)";
+	} elsif (exists($revdesc{"lts-changeid-commit-$changeid"})) {
+		$style = "; style=filled, fillcolor=\"yellow;0.3:blue\"";
+		$style_label = " | picked (as per changeid)";
+	} elsif (exists($revdesc{"$curr_commit-api-change-breaking"})) {
+		$style = "; style=filled, fillcolor=\"red\"";
+		$style_label = " | intrusive API change";
+	} elsif (exists($revdesc{"$curr_commit-api-change"})) {
+		$style = "; style=filled, fillcolor=\"red;0.3:yellow\"";
+		$style_label = " | add-only API: check rqd";
+	}
+	if ($do_nocolor) {
+		$style = "";	
+	}
+	print("   commit_$curr_commit [ label=\"", $curr_commit, " | " , $revdesc{$curr_commit}, " | ", $changeid, $style_label, "\", xlabel=\"\"$style];\n");
+}
+
+sub gv_print_arrow {
+	my ($src, $dst) = @_;
+	print("   commit_$src -> commit_$dst;\n");
+}
+
+sub gv_print_arrow_faint {
+	my ($src, $dst) = @_;
+	print("   commit_$src -> commit_$dst [ style=dotted, color=blue ];\n");
+}
+
+sub gv_print_header {
+	print("digraph G {\n");
+        print("  nodesep=0.9;\n");
+	print("  rankdir=LR;\n");
+	print("  splines=false;\n");
+	print("  graph [pad=0.5,nodesep=0.5,ranksep=1.5];\n");
+	print("  overlap = false;\n");
+	print("  node [shape=record, color=gray];\n");
+}
+
+sub gv_print_trailer {
+	print("}\n");
+}
+
+$git_root = `git rev-parse --show-toplevel`;
+$git_root =~ s/^\s+//;
+$git_root =~ s/\s+$//;
+chdir($git_root) or die "$!";
+
+while (($#ARGV >= 0)  && (substr($ARGV[0], 0, 1) eq "-")) {
+	if ($ARGV[0] eq "-v") { $do_print += 1; }
+	if ($ARGV[0] eq "-f") { $do_full_analysis += 1; }
+	if ($ARGV[0] eq "-g") { $do_graphviz += 1; }
+	if ($ARGV[0] eq "-n") { $do_nocolor += 1; }
+	if ($ARGV[0] eq "-a") { $do_add_solo_commits += 1; }
+	shift(@ARGV);
+}
+
+my ($oldrev_arg, $newrev_arg) = @ARGV;
+
+$oldrev_arg ||= $fork_point_arg;
+$newrev_arg ||= $master_head_arg;
+
+# $newrev_arg ||= 'HEAD';
+
+
+print(STDERR "Old rev: $oldrev_arg new rev: $newrev_arg\n");
+my ($oldrev, $newrev);
+$oldrev = git_rev_parse($oldrev_arg);
+$newrev = git_rev_parse($newrev_arg);
+# print("Old rev: $oldrev new rev: $newrev\n");
+
+
+open($revlist, '-|', 'git', '--no-pager', 'rev-list', "--pretty=oneline", "$oldrev..$newrev") or die;
+my @revlist;
+my %revdesc;
+
+@lines = <$revlist>;
+foreach (@lines) { 
+	chomp($_); 
+	if (m{^([0-9a-fA-F]+)\s(.+?)$}) {
+		my $key = $1;
+		push(@revlist, $key);
+		$revdesc{$key} = $2;
+		$revdesc{$key} =~ s/"/'/g;
+		$revdesc{$key} =~ s#\|#/#g;
+		$revdesc{$key} =~ s#<#&lt;#g;
+		$revdesc{$key} =~ s#>#&gt;#g;
+	}
+}
+foreach (@revlist) {
+	my $desc = $revdesc{$_};
+	print("rev: $_ : $desc\n") if ($do_print > 2);
+}
+
+open($cpicks, '-|', 'git', 'cherry', $lts_branch_arg, $newrev_arg) or die;
+@lines = <$cpicks>;
+foreach (@lines) {
+	chomp($_);
+	if (m{^\+\s([0-9a-fA-F]+)$}) {
+		$k = $1;
+		$revdesc{"$k-cpick"} = 0; # not cherrypicked 
+	} elsif (m{^\-\s([0-9a-fA-F]+)$}) {
+		$k = $1;
+		$revdesc{"$k-cpick"} = 1; # cherrypicked 
+	} else {
+		die("Unknown line $_");
+	}
+}
+
+
+# read the master commits
+
+open($revlist, '-|', 'git', '--no-pager', 'log', "--pretty=raw", "--stat", "$oldrev..$newrev") or die;
+@lines = <$revlist>;
+my $tmp_commit = "";
+my $tmp_change_id = "";
+my $tmp_next_commit = "";
+foreach (@lines) { 
+	chomp($_); 
+	# print("DBG:$_|\n");
+	if (m{^commit\s+([0-9a-fA-F]+)$}) {
+		$tmp_next_commit = $tmp_commit;
+		$tmp_commit = $1;
+		if ($tmp_next_commit ne "") {
+			$revdesc{"$tmp_commit-next-commit"} = $tmp_next_commit;
+		}	
+		print("Found commit: $tmp_commit , next commit $tmp_next_commit\n") if ($do_print > 1);
+	} elsif (m{^author .*? (\d+) ([-+]\d\d\d\d)$}) {
+		my $tmp_ts = $1;
+		my $tmp_tz = $2;
+		$revdesc{"$tmp_commit-author-timestamp"} = $tmp_ts;
+		$revdesc{"$tmp_commit-author-tz"} = $tmp_ts;
+		# print(STDERR "commit: $tmp_commit ts: $tmp_ts tz: $tmp_tz\n")
+	} elsif (m{^committer .*? (\d+) ([-+]\d\d\d\d)$}) {
+		my $tmp_ts = $1;
+		my $tmp_tz = $2;
+		$revdesc{"$tmp_commit-committer-timestamp"} = $tmp_ts;
+		$revdesc{"$tmp_commit-committer-tz"} = $tmp_ts;
+		# print(STDERR "commit: $tmp_commit ts: $tmp_ts tz: $tmp_tz\n")
+		# DBG:committer Florin Coras <florin.coras@gmail.com> 1569348246 +0000|
+	} elsif (m{^\s\s\s+Change-Id:\s+(\S+)$}) {
+		$tmp_change_id = $1;
+		print("Commit: $tmp_commit; change: $tmp_change_id\n") if ($do_print > 1);
+		$revdesc{"$tmp_commit-changeid"} = $tmp_change_id;
+	} elsif (m{^\s(\S+?\.api)\s+\|\s+\d+\s+(\+*)(\-*)\s*$}) {
+	    #  src/vnet/interface.api              | 216 +++++++++++++++++++++++++++++++++++----------------------------------------------------------
+	        my $api_file = $1;
+		my $api_adds = length($2);
+		my $api_dels = length($3);
+	        print("Commit: $tmp_commit changes file $api_file adds: $api_adds dels: $api_dels\n") if ($do_print > 1);
+		$revdesc{"$tmp_commit-api-change"} = 1;
+		if ($api_dels > 0) {
+			$revdesc{"$tmp_commit-api-change-breaking"} = 1;
+		}
+	}
+
+}
+# add the LTS commits so we can doublecheck the false negatives from git cherry
+open($revlist, '-|', 'git', '--no-pager','log', "--pretty=raw", "--stat", "$oldrev..refs/heads/$lts_branch_arg") or die;
+@lines = <$revlist>;
+
+$tmp_commit = "";
+$tmp_change_id = "";
+foreach (@lines) { 
+	chomp($_); 
+	# print("DBG:$_|\n");
+	if (m{^commit\s+([0-9a-fA-F]+)$}) {
+		$tmp_commit = $1;
+	} elsif (m{^\s\s\s+Change-Id:\s+(\S+)$}) {
+		$tmp_change_id = $1;
+		print("LTS Commit: $tmp_commit; change: $tmp_change_id\n") if ($do_print > 1);
+		$revdesc{"lts-changeid-commit-$tmp_change_id"} = $tmp_commit;
+	}
+}
+
+
+my %revlist = map { $_ => 1 } @revlist;
+
+my %anchors_of;
+my %anchored_commits;
+if ($do_full_analysis == 0) {
+	my $curr_commit = $newrev;
+	my @commits = get_anchor_commits($curr_commit, %revlist);
+	if ($do_graphviz) {
+		gv_print_header();
+		gv_print_commit($curr_commit, %revdesc);
+	}
+	foreach (@commits) {
+		my $anchor_commit = $_;
+		if (!exists $anchors_of{$curr_commit}) {
+			my @arr;
+			$anchors_of{$curr_commit} = \@arr;
+		}
+		push(@{$anchors_of{$curr_commit}}, $anchor_commit);
+
+		if ($do_graphviz) {
+			gv_print_commit($anchor_commit, %revdesc);
+			gv_print_arrow($curr_commit, $anchor_commit);
+		} else {
+			print("$curr_commit $anchor_commit\n");
+		}
+	}
+	if ($do_graphviz) {
+		gv_print_trailer();
+	}
+	exit(0);
+} else {
+	if ($do_graphviz) {
+		gv_print_header();
+	}
+	my $done_commit_count = 0;
+	my $start_time = time();
+	foreach (@revlist) {
+		my $curr_commit = $_;
+		my @commits = get_anchor_commits($curr_commit, %revlist);
+		if ($do_graphviz && $do_add_solo_commits) {
+			gv_print_commit($curr_commit, %revdesc);
+		}
+		foreach (@commits) {
+			my $anchor_commit = $_;
+			if (!exists $anchors_of{$curr_commit}) {
+				if ($do_graphviz && !$do_add_solo_commits) {
+					gv_print_commit($curr_commit, %revdesc);
+				}
+				my @arr;
+				$anchors_of{$curr_commit} = \@arr;
+			}
+			push(@{$anchors_of{$curr_commit}}, $anchor_commit);
+
+			if (!exists $anchored_commits{$anchor_commit}) {
+				if ($do_graphviz) {
+					gv_print_commit($anchor_commit, %revdesc);
+				}
+				my @arr;
+				$anchored_commits{$anchor_commit} = \@arr;
+			}
+			push(@{$anchored_commits{$anchor_commit}}, $curr_commit);
+			if ($do_graphviz) {
+				gv_print_arrow($curr_commit, $anchor_commit);
+			}
+			if ($do_print) {
+				my $ts1 = $revdesc{"$curr_commit-committer-timestamp"};
+				my $ts0 = $revdesc{"$anchor_commit-committer-timestamp"};
+				my $tsdelta = ($ts1-$ts0)/(24*3600);
+				print("$curr_commit $anchor_commit $tsdelta\n");
+			}
+		}
+		$done_commit_count += 1;
+		my $time_now = time();
+		my $time_delta = $time_now - $start_time;
+		my $estimated_total_time = ($time_delta) * $#revlist / $done_commit_count;
+		my $time_remaining = $estimated_total_time - $time_delta;
+		print(STDERR "$time_delta seconds spent, done ", $done_commit_count, " out of ", $#revlist, "; estimated remaining $time_remaining seconds\n");
+	}
+	if ($do_graphviz) {
+		gv_print_trailer();
+	}
+	if ($do_print > 1) {
+		print Dumper(\%anchors_of);
+		print Dumper(\%anchored_commits);
+	}
+}
+
+
