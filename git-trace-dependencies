@@ -203,9 +203,9 @@ sub gv_print_commit {
 	if ($do_nocolor) {
 		$style = "";	
 	}
-	my $text_label = $curr_commit;
+	my $text_label = $revdesc{$curr_commit};
 	$text_label =~ s/[^-_A-Za-z0-9,.!?: ]/_/g;
-	print("   commit_$curr_commit [ label=\"", $curr_commit, " | " , $revdesc{$curr_commit}, " | ", $changeid, $style_label, "\", xlabel=\"\"$style];\n");
+	print("   commit_$curr_commit [ label=\"", $curr_commit, " | " , $text_label, " | ", $changeid, $style_label, "\", xlabel=\"\"$style];\n");
 }
 
 sub gv_print_arrow {
